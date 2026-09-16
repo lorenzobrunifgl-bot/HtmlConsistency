@@ -964,18 +964,16 @@
       }
 
       if(!shadow){
-        // Bootstrap: questo dispositivo non ha mai sincronizzato prima, ma
-        // il cloud esiste già.
-        if(isPristineLocal(localData)){
-          // Nessuna modifica locale reale: pull silenzioso, nessun rischio.
-          applyCloudData(row.data);
-          saveShadow(row);
-          finishOk(false);
-        } else {
-          // Dati locali reali mai sincronizzati + cloud già esistente:
-          // conflitto di bootstrap, stessa regola del conflitto a regime.
-          resolveConflict(row, localData, attempt);
-        }
+        // Bootstrap: questo dispositivo non ha mai sincronizzato prima,
+        // ma il cloud esiste già.
+        // Il primo collegamento di un nuovo dispositivo deve essere
+        // cloud-first: i dati locali vengono messi al sicuro come backup,
+        // poi si scarica il cloud. I conflitti veri vengono gestiti
+        // successivamente, quando esiste una shadow.
+        backupLocalBootstrap(localData);
+        applyCloudData(row.data);
+        saveShadow(row);
+        finishOk(false);
         return;
       }
 
@@ -1020,6 +1018,18 @@
   // avviso esplicito (mai un "✓ sync" silenzioso). Push condizionato sulla
   // version appena letta: se anche questo fallisce (altra race strettissima)
   // si ritenta invece di sovrascrivere alla cieca.
+  function backupLocalBootstrap(localData){
+    try{
+      localStorage.setItem(
+        "task-del-giorno-bootstrap-backup",
+        JSON.stringify({
+          savedAt: new Date().toISOString(),
+          data: localData
+        })
+      );
+    }catch(e){}
+  }
+
   function resolveConflict(cloudRow, localData, attempt){
     backupOverwrittenCloud(cloudRow.data||{});
     sb.from("user_data").update({data:localData}).eq("user_id",user.id).eq("version",cloudRow.version).select().then(function(ur){
