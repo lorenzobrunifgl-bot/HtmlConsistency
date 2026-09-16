@@ -12,7 +12,7 @@
 <script>
   // Configurazione cloud (valori PUBBLICI: sicuri nel frontend, protetti da RLS)
   window.SUPA_URL = "https://qbyxhczcorlnyvukyubd.supabase.co";
-window.SUPA_ANON = "sb_publishable_s488xbyeaS1XaAj41tNTsw_vqu2O2Ez";
+  window.SUPA_ANON = "sb_publishable_s488xbyeaS1XaAj41tNTsw_vqu2O2Ez";
 </script>
 <style>
   :root{
@@ -753,46 +753,99 @@ window.SUPA_ANON = "sb_publishable_s488xbyeaS1XaAj41tNTsw_vqu2O2Ez";
 </script>
 <script>
 // ============================================================
-// MODULO SYNC — Piano B: sync MANUALE, semplice, affidabile
-// Nessun timer automatico. Nessun merge per-campo.
-// Un solo pulsante "Sincronizza ora" che l'utente controlla.
-// Merge: last-write-wins per giorno intero (updated_at del cloud vs locale).
+// MODULO SYNC — tabella unica public.user_data, sync MANUALE.
+// Un solo blob per utente: { state, hist, path, coach }.
+// Nessun merge per campo: whole-blob last-write-wins, deciso con
+// version (server-side, monotona) + confronto di contenuto contro
+// una "shadow" locale — MAI confrontando updated_at (orologio del
+// server) con un orologio del dispositivo: i due non sono la stessa
+// linea del tempo, confrontarli direttamente è la causa esatta dei
+// bug di convergenza del vecchio modulo. updated_at resta solo
+// un'informazione da mostrare in UI.
+// Nessun timer automatico. Nessun location.reload().
 // ============================================================
 (function(){
   var KEY="task-del-giorno", HKEY="task-del-giorno-storico", PKEY="task-del-giorno-percorso", CKEY="task-del-giorno-coach";
-  var LKEY="task-del-giorno-localt"; // quando ho modificato in locale (per giorno e per blob)
+  // Unica chiave di stato del sync: l'istantanea {version,data,updated_at}
+  // di user_data così com'era all'ultimo pull/push riuscito DA QUESTO
+  // dispositivo. Sostituisce ogni timestamp per-chiave: qui basta un
+  // confronto di contenuto, mai un confronto di orologi.
+  var SHADOW_KEY="task-del-giorno-cloudshadow";
+  // Stesso "slot" di backup già usato dall'import (vedi impFile.onchange
+  // sopra): un solo backup dell'ultima cosa sovrascritta, non un log —
+  // coerente con "niente complessità inutile".
+  var PREV_KEY="task-del-giorno-prev";
+  var MAX_ATTEMPTS=5; // tetto ai retry su race (insert duplicato / update condizionato a 0 righe)
+
   var chip=document.getElementById("syncChip");
   var sb=null, user=null, syncing=false;
 
   function setChip(t){ if(chip) chip.textContent=t; }
   function jget(k,def){ try{ var v=localStorage.getItem(k); return v?JSON.parse(v):def; }catch(e){ return def; } }
   function jset(k,v){ try{ localStorage.setItem(k,JSON.stringify(v)); }catch(e){} }
-  function nowISO(){ return new Date().toISOString(); }
-  function pad(n){ return n<10?"0"+n:""+n; }
-  function todayKey(){ var d=new Date(); return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate()); }
 
-  // Registra quando modifico in locale (senza intercettare setItem globale)
-  function stampLocal(day){
-    var lt=jget(LKEY,{}); lt[day||todayKey()]=nowISO();
-    lt["__state"]=nowISO(); lt["__path"]=lt["__path"]||"1970"; lt["__coach"]=lt["__coach"]||"1970";
-    try{ localStorage.setItem(LKEY,JSON.stringify(lt)); }catch(e){}
+  // Confronto di contenuto indipendente dall'ordine delle chiavi: jsonb di
+  // Postgres non garantisce di restituire le chiavi nell'ordine in cui sono
+  // state scritte, quindi un confronto testuale (JSON.stringify(a)!==
+  // JSON.stringify(b)) può vedere "cambiato" un dato identico solo perché è
+  // tornato dal cloud con le chiavi in un ordine diverso.
+  function deepEqual(a,b){
+    if(a===b) return true;
+    if(a===null||b===null||typeof a!=="object"||typeof b!=="object") return a===b;
+    if(Array.isArray(a)!==Array.isArray(b)) return false;
+    if(Array.isArray(a)){
+      if(a.length!==b.length) return false;
+      for(var i=0;i<a.length;i++){ if(!deepEqual(a[i],b[i])) return false; }
+      return true;
+    }
+    var ka=Object.keys(a), kb=Object.keys(b);
+    if(ka.length!==kb.length) return false;
+    for(var j=0;j<ka.length;j++){
+      var k=ka[j];
+      if(!Object.prototype.hasOwnProperty.call(b,k)) return false;
+      if(!deepEqual(a[k],b[k])) return false;
+    }
+    return true;
   }
-  function stampPath(){ var lt=jget(LKEY,{}); lt["__path"]=nowISO(); try{ localStorage.setItem(LKEY,JSON.stringify(lt)); }catch(e){} }
-  function stampCoach(){ var lt=jget(LKEY,{}); lt["__coach"]=nowISO(); try{ localStorage.setItem(LKEY,JSON.stringify(lt)); }catch(e){} }
 
-  // Aggancia le funzioni dell'app che modificano i dati
-  window.addEventListener("load", function(){
-    // Ogni volta che l'app salva (commit, setOccupied, dayNote, workout, swim)
-    // l'app chiama save(state) o saveH(hist) che scrivono localStorage.
-    // Intercettiamo solo le chiavi che ci interessano, senza rompere niente.
-    var _orig = localStorage.setItem.bind(localStorage);
-    localStorage.setItem = function(k,v){
-      _orig(k,v);
-      if(k===KEY||k===HKEY) stampLocal(todayKey());
-      if(k===PKEY) stampPath();
-      if(k===CKEY) stampCoach();
-    };
-  });
+  // ---- il blob unico {state,hist,path,coach} ----
+  function buildLocalData(){
+    return { state:jget(KEY,{}), hist:jget(HKEY,{}), path:jget(PKEY,{}), coach:jget(CKEY,[]) };
+  }
+  // Scrive le 4 chiavi locali da un blob arrivato dal cloud, poi aggiorna lo
+  // stato in memoria e ridisegna tramite l'hook già esposto dalla parte
+  // non-sync — nessun reload.
+  function applyCloudData(data){
+    jset(KEY, data.state||{});
+    jset(HKEY, data.hist||{});
+    jset(PKEY, data.path||{});
+    jset(CKEY, data.coach||[]);
+    if(window.__taskAppRerender) window.__taskAppRerender();
+  }
+  function loadShadow(){ return jget(SHADOW_KEY, null); }
+  function saveShadow(row){ jset(SHADOW_KEY, { version:row.version, data:row.data, updated_at:row.updated_at }); }
+
+  // Un dispositivo è "pristino" se non ha mai fatto nulla di suo: nessuna
+  // task/scuola spuntata, nessuna voce reale nello storico oltre al seed del
+  // giorno corrente, percorso ai valori di default, nessuna decisione coach.
+  // Serve SOLO per il bootstrap (dispositivo senza shadow + cloud già
+  // esistente): un controllo di contenuto fatto una volta, non un merge.
+  var DEFAULT_PATH={goal:"Costanza sostenibile + fisico atletico",phase:"Pre-operatoria LCA (solo parte alta + nuoto)",consistency:"In costruzione",priority:"Non spezzare la serie; usare la Minimum nei giorni storti",hold:"Struttura settimanale attuale",constraints:"Ginocchio: no corsa/salti/cambi direzione fino a indicazione medica"};
+  function isPristineLocal(d){
+    var st=d.state||{};
+    var tasksTouched=(st.tasks||[]).some(function(t){ return t.done||t.floorDone; });
+    var schoolTouched=(st.school||[]).some(function(t){ return t.done; });
+    if(tasksTouched||schoolTouched) return false;
+    var h=d.hist||{};
+    var histTouched=Object.keys(h).some(function(day){
+      var rec=h[day]||{};
+      return !!(rec.tasks||rec.school||rec.workout||rec.swim||rec.note||rec.occupied!==undefined||rec.review);
+    });
+    if(histTouched) return false;
+    if(!deepEqual(d.path||{}, DEFAULT_PATH)) return false;
+    if((d.coach||[]).length) return false;
+    return true;
+  }
 
   function initClient(){
     if(!window.supabase||!window.SUPA_URL||!window.SUPA_ANON) return false;
@@ -800,7 +853,7 @@ window.SUPA_ANON = "sb_publishable_s488xbyeaS1XaAj41tNTsw_vqu2O2Ez";
     return true;
   }
 
-  // ---- AUTH UI ----
+  // ---- AUTH UI (invariata rispetto a prima) ----
   function refreshAuthUI(){
     var st=document.getElementById("cloudStatus"), so=document.getElementById("cloudSignOut"), si=document.getElementById("cloudSignIn");
     if(st) st.textContent=user?("Connesso come "+user.email):"Non connesso (solo questo dispositivo).";
@@ -842,126 +895,140 @@ window.SUPA_ANON = "sb_publishable_s488xbyeaS1XaAj41tNTsw_vqu2O2Ez";
   document.getElementById("cloudSignOut").onclick=function(){ if(sb) sb.auth.signOut().then(function(){ location.reload(); }); };
   document.getElementById("cloudSyncNow").onclick=function(){ if(user) doSync(); else openLogin(); };
 
-  // ---- SYNC: logica semplice ----
-  // Per i giorni: last-write-wins sul updated_at dell'intera riga.
-  // Per stato/path/coach: last-write-wins sul timestamp locale vs cloud.
-  // Nessun merge per campo. Nessun timer automatico.
-  // L'utente preme "Sincronizza ora" e i dati si allineano.
+  function showErr(msg){ setChip("errore ⚠"); var cs=document.getElementById("cloudStatus"); if(cs) cs.textContent="Errore sync: "+msg; }
+  function showConflict(){
+    setChip("conflitto ⚠"); // niente auto-revert: resta finché non si rifà un sync pulito
+    var cs=document.getElementById("cloudStatus");
+    if(cs) cs.textContent="Conflitto rilevato: i dati di questo dispositivo hanno sostituito quelli del cloud. La versione precedente del cloud è salvata in backup locale.";
+  }
+  function finishOk(conflict){
+    syncing=false;
+    if(conflict){ showConflict(); return; }
+    setChip("✓ sync");
+    var cs=document.getElementById("cloudStatus");
+    if(cs&&user) cs.textContent="Connesso come "+user.email+" · sync ok "+new Date().toLocaleTimeString("it-IT",{hour:"2-digit",minute:"2-digit"});
+    setTimeout(function(){ setChip(user?"cloud":""); },2500);
+  }
+  // Salva la versione cloud che sta per essere sovrascritta, riusando lo
+  // stesso backup già usato dall'import — mai una perdita silenziosa.
+  function backupOverwrittenCloud(cloudData){
+    try{
+      jset(PREV_KEY, { state:cloudData.state||{}, hist:cloudData.hist||{}, path:cloudData.path||{}, coach:cloudData.coach||[], at:new Date().toISOString(), reason:"conflitto sync" });
+    }catch(e){}
+  }
 
+  // ---- SYNC ----
+  // Un solo pulsante, un solo giro (con retry interni bounded su race),
+  // nessun timer. Regole:
+  //  - version (colonna server, monotona, incrementata dal trigger — MAI
+  //    version+1 lato client) dice se il cloud si è mosso dall'ultimo sync
+  //    di QUESTO dispositivo;
+  //  - il confronto di contenuto contro la shadow dice se QUESTO
+  //    dispositivo ha modifiche proprie non ancora sincronizzate;
+  //  - updated_at non entra MAI in una decisione, solo in UI.
   function doSync(){
     if(!user||!sb||syncing) return;
     syncing=true; setChip("sync…");
+    if(window.__recordToday) window.__recordToday(); // allinea hist[oggi] a state prima di leggere
+    attemptRound(0);
+  }
 
-    // Prima del sync: assicura che le spunte live di oggi siano in HKEY
-    // recordToday() è esposta dall'app principale e aggiorna hist[oggi] da state
-    if(window.__recordToday) window.__recordToday();
+  function attemptRound(attempt){
+    if(attempt>=MAX_ATTEMPTS){ syncing=false; showErr("troppi tentativi concorrenti, riprova tra poco"); return; }
+    var localData=buildLocalData();
+    var shadow=loadShadow();
 
-    var lt=jget(LKEY,{});
-    var today=todayKey();
-    // Se oggi non ha un timestamp locale, significa che non abbiamo mai registrato
-    // una modifica su questo dispositivo per oggi → usiamo adesso come base
-    // (così il giorno di oggi viene sempre pushato con un timestamp reale)
-    if(!lt[today]||lt[today]==="1970-01-01T00:00:00.000Z"){
-      lt[today]=nowISO();
-      try{ localStorage.setItem(LKEY,JSON.stringify(lt)); }catch(e){}
-    }
+    sb.from("user_data").select("data,version,updated_at").eq("user_id",user.id).maybeSingle().then(function(r){
+      if(r.error){ syncing=false; showErr((r.error.message||"errore lettura")+(r.error.code?" ["+r.error.code+"]":"")); return; }
+      var row=r.data||null;
 
-    var localHist=jget(HKEY,{});
-    var localState=jget(KEY,{});
-
-    // PULL: scarica tutto dal cloud
-    Promise.all([
-      sb.from("app_state").select("data,updated_at").eq("user_id",user.id).maybeSingle(),
-      sb.from("days").select("day,data,updated_at").eq("user_id",user.id),
-      sb.from("path_state").select("data,updated_at").eq("user_id",user.id).maybeSingle(),
-      sb.from("coach_updates").select("data,updated_at").eq("user_id",user.id).maybeSingle()
-    ]).then(function(res){
-      var perr=null; res.forEach(function(r){ if(r&&r.error) perr=r.error; });
-      if(perr){ syncing=false; showErr((perr.message||"errore lettura")+(perr.code?" ["+perr.code+"]":"")); return; }
-
-      var cloudState=res[0].data?res[0].data.data:null, cStateAt=res[0].data?res[0].data.updated_at:"";
-      var cloudDays={}; (res[1].data||[]).forEach(function(r){ cloudDays[r.day]={data:r.data,at:r.updated_at}; });
-      var cloudPath=res[2].data?res[2].data.data:null, cPathAt=res[2].data?res[2].data.updated_at:"";
-      var cloudCoach=res[3].data?res[3].data.data:null, cCoachAt=res[3].data?res[3].data.updated_at:"";
-
-      // MERGE giorni: per ogni giorno, vince il più recente tra locale e cloud
-      // Il timestamp locale = lt[day] (quando l'utente ha modificato quel giorno su questo dispositivo)
-      // Il timestamp cloud = cloudDays[day].at
-      var mergedDays={}, pushDays=[];
-      var allDays={};
-      Object.keys(localHist).forEach(function(d){ allDays[d]=1; });
-      Object.keys(cloudDays).forEach(function(d){ allDays[d]=1; });
-
-      Object.keys(allDays).forEach(function(day){
-        var localAt=lt[day]||"1970-01-01T00:00:00.000Z";
-        var cd=cloudDays[day]; var cloudAt=cd?cd.at:"";
-        // Il giorno CORRENTE: il locale vince sempre (stai lavorando su questo dispositivo adesso)
-        // I giorni passati: vince il più recente tra locale e cloud
-        var localWins = (day===today) || !cd || localAt>=cloudAt;
-        if(!cd){
-          // giorno solo in locale → pushiamo
-          mergedDays[day]=localHist[day];
-          var pushAt=localAt>"1970-01-01T00:00:00.001Z"?localAt:nowISO();
-          pushDays.push({user_id:user.id,day:day,data:localHist[day],updated_at:pushAt});
-        } else if(!localHist[day]){
-          // giorno solo in cloud → prendiamo il cloud (ma non oggi)
-          if(day!==today) mergedDays[day]=cd.data;
-          else { mergedDays[day]={}; } // oggi vuoto in locale → resta vuoto
-        } else {
-          if(localWins){
-            // locale vince: teniamo locale e pushiamo
-            mergedDays[day]=localHist[day];
-            var pushAt2=localAt>"1970-01-01T00:00:00.001Z"?localAt:nowISO();
-            pushDays.push({user_id:user.id,day:day,data:localHist[day],updated_at:pushAt2});
-          } else {
-            // cloud più recente: prendiamo cloud
-            mergedDays[day]=cd.data;
+      if(!row){
+        // Nessuna riga cloud: primo sync in assoluto per questo utente.
+        sb.from("user_data").insert({user_id:user.id, data:localData}).select().then(function(ir){
+          if(ir.error){
+            if(ir.error.code==="23505"){
+              // Race sul primo insert: un altro dispositivo l'ha appena
+              // creata. Non è un errore: si rifà il SELECT e si continua
+              // il flusso normale (finirà nel ramo "shadow assente, riga
+              // presente" sotto).
+              attemptRound(attempt+1); return;
+            }
+            syncing=false; showErr((ir.error.message||"errore insert")+" ["+ir.error.code+"]"); return;
           }
+          var newRow=(ir.data&&ir.data[0])||null;
+          if(!newRow){ syncing=false; showErr("insert non confermato dal server"); return; }
+          saveShadow(newRow);
+          finishOk(false);
+        });
+        return;
+      }
+
+      if(!shadow){
+        // Bootstrap: questo dispositivo non ha mai sincronizzato prima, ma
+        // il cloud esiste già.
+        if(isPristineLocal(localData)){
+          // Nessuna modifica locale reale: pull silenzioso, nessun rischio.
+          applyCloudData(row.data);
+          saveShadow(row);
+          finishOk(false);
+        } else {
+          // Dati locali reali mai sincronizzati + cloud già esistente:
+          // conflitto di bootstrap, stessa regola del conflitto a regime.
+          resolveConflict(row, localData, attempt);
         }
-      });
-
-      // MERGE stato: last-write-wins
-      var stateLocalAt=lt["__state"]||"1970-01-01T00:00:00.000Z";
-      var finalState=localState, pushState=true;
-      if(cloudState && cStateAt>stateLocalAt){
-        finalState=cloudState; pushState=false;
-        try{ localStorage.setItem(KEY,JSON.stringify(cloudState)); }catch(e){}
+        return;
       }
 
-      // MERGE path e coach
-      var pathLocalAt=lt["__path"]||"1970-01-01T00:00:00.000Z";
-      if(cloudPath && cPathAt>pathLocalAt) jset(PKEY,cloudPath);
-      var coachLocalAt=lt["__coach"]||"1970-01-01T00:00:00.000Z";
-      if(cloudCoach && cCoachAt>coachLocalAt) jset(CKEY,cloudCoach);
-
-      // Scrivo lo storico mergeato in locale
-      try{ localStorage.setItem(HKEY,JSON.stringify(mergedDays)); }catch(e){}
-
-      // PUSH: manda al cloud quello che ha vinto in locale
-      var pushes=[];
-      if(pushState){
-        var sat=stateLocalAt>"1970-01-01T00:00:00.001Z"?stateLocalAt:nowISO();
-        pushes.push(sb.from("app_state").upsert({user_id:user.id,data:finalState,updated_at:sat}));
+      if(row.version===shadow.version){
+        // Il cloud non si è mosso dall'ultimo sync di questo dispositivo.
+        if(deepEqual(localData, shadow.data)){
+          finishOk(false); return; // nessuna modifica da nessuna parte: nessuna scrittura
+        }
+        // Solo questo dispositivo ha modificato: push pulito e condizionato.
+        sb.from("user_data").update({data:localData}).eq("user_id",user.id).eq("version",shadow.version).select().then(function(ur){
+          if(ur.error){ syncing=false; showErr((ur.error.message||"errore update")+" ["+ur.error.code+"]"); return; }
+          if(!ur.data||!ur.data.length){
+            // L'update condizionato non ha toccato righe: qualcuno ha
+            // scritto proprio nel mezzo. Non è un errore: si rilegge e si
+            // rivaluta da capo.
+            attemptRound(attempt+1); return;
+          }
+          saveShadow(ur.data[0]);
+          finishOk(false);
+        });
+        return;
       }
-      var pat=pathLocalAt>"1970-01-01T00:00:00.001Z"?pathLocalAt:nowISO();
-      pushes.push(sb.from("path_state").upsert({user_id:user.id,data:jget(PKEY,{}),updated_at:pat}));
-      var cat=coachLocalAt>"1970-01-01T00:00:00.001Z"?coachLocalAt:nowISO();
-      pushes.push(sb.from("coach_updates").upsert({user_id:user.id,data:jget(CKEY,[]),updated_at:cat}));
-      if(pushDays.length) pushes.push(sb.from("days").upsert(pushDays,{onConflict:"user_id,day"}));
 
-      Promise.all(pushes).then(function(pr){
-        var werr=null; pr.forEach(function(r){ if(r&&r.error) werr=r.error; });
-        if(werr){ syncing=false; showErr((werr.message||"errore scrittura")+(werr.code?" ["+werr.code+"]":"")); return; }
-        syncing=false; setChip("✓ sync");
-        var cs=document.getElementById("cloudStatus"); if(cs&&user) cs.textContent="Connesso come "+user.email+" · sync ok "+new Date().toLocaleTimeString("it-IT",{hour:"2-digit",minute:"2-digit"});
-        setTimeout(function(){ setChip(user?"cloud":""); },3000);
-        // Se abbiamo preso dati nuovi dal cloud, aggiorna la UI senza reload
-        if(window.__taskAppRerender){ window.__taskAppRerender(); }
-      }, function(err){ syncing=false; showErr((err&&err.message)||"push fallito"); });
+      // version diversa: il cloud è cambiato da un altro dispositivo dopo
+      // l'ultimo sync di QUESTO dispositivo.
+      if(deepEqual(localData, shadow.data)){
+        // Questo dispositivo non ha nulla di suo da proteggere: pull.
+        applyCloudData(row.data);
+        saveShadow(row);
+        finishOk(false);
+      } else {
+        // Questo dispositivo ha modifiche proprie E il cloud è cambiato
+        // indipendentemente: conflitto genuino.
+        resolveConflict(row, localData, attempt);
+      }
     }, function(err){ syncing=false; setChip("offline"); });
   }
 
-  function showErr(msg){ setChip("errore ⚠"); var cs=document.getElementById("cloudStatus"); if(cs) cs.textContent="Errore sync: "+msg; }
+  // Conflitto genuino (a regime o al bootstrap): vince il dispositivo che
+  // ha appena premuto "Sincronizza ora", ma solo dopo aver messo in
+  // sicurezza la versione cloud che sta per sparire, e sempre con un
+  // avviso esplicito (mai un "✓ sync" silenzioso). Push condizionato sulla
+  // version appena letta: se anche questo fallisce (altra race strettissima)
+  // si ritenta invece di sovrascrivere alla cieca.
+  function resolveConflict(cloudRow, localData, attempt){
+    backupOverwrittenCloud(cloudRow.data||{});
+    sb.from("user_data").update({data:localData}).eq("user_id",user.id).eq("version",cloudRow.version).select().then(function(ur){
+      if(ur.error){ syncing=false; showErr((ur.error.message||"errore update")+" ["+ur.error.code+"]"); return; }
+      if(!ur.data||!ur.data.length){ attemptRound(attempt+1); return; }
+      saveShadow(ur.data[0]);
+      finishOk(true);
+    });
+  }
 
   // ---- BOOT ----
   function boot(){
@@ -975,11 +1042,10 @@ window.SUPA_ANON = "sb_publishable_s488xbyeaS1XaAj41tNTsw_vqu2O2Ez";
       if(sess&&sess.user){ user=sess.user; setChip("cloud"); refreshAuthUI(); closeLogin(); }
       else { user=null; refreshAuthUI(); }
     });
-    // Nessun timer automatico. Sync solo su richiesta manuale.
+    // Nessun timer automatico. Sync solo su richiesta manuale (Piano B fase 1).
   }
   if(window.supabase) boot(); else window.addEventListener("load",boot);
 })();
-
 </script>
 </body>
 </html>
